@@ -8,13 +8,15 @@ clamped to their true one-hot labels:
     z_{t+1} = z_t - step_size * dE/dz_t
 
 Training unrolls this inference and backpropagates through it (end-to-end).
-Each epoch the train nodes are split at random: half are clamped as known, the
-other half are hidden and the cross-entropy of the inferred colors against
-their true labels is the loss. Val/test nodes are never clamped or used in the
-loss. At evaluation all train nodes are clamped and the rest are inferred.
+FIXED-HIDE VARIANT: the train nodes are split once, before training: half are
+clamped as known, the other half are hidden, and the same split is used every
+epoch. The cross-entropy of the inferred colors on the hidden nodes is the
+loss. Val/test nodes are never clamped or used in the loss. At evaluation all
+train nodes are clamped and the rest are inferred.
 """
 
-import copy
+import argparse
+import os
 import sys
 
 import matplotlib.pyplot as plt
@@ -22,13 +24,22 @@ import torch
 import torch.nn.functional as F
 from model import EnergyBasedGNN
 
+# The shared helpers live in the repo root, one folder up.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from model_utils import EarlyStopping, add_early_stopping_arg, report_results  # noqa: E402
+
 torch.manual_seed(0)
 
 NUM_CLASSES = 3
 EPOCHS = 200
 INFERENCE_STEPS = 20
 STEP_SIZE = 1.0
-HIDDEN_FRACTION = 0.5  # share of train nodes hidden (predicted) each epoch
+HIDDEN_FRACTION = 0.5  # share of train nodes hidden (predicted), fixed for all epochs
+HIDE_SEED = 0  # seed for the one-time choice of hidden train nodes
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+add_early_stopping_arg(parser)
+args = parser.parse_args()
 
 data = torch.load("data/graph.pt", weights_only=False)
 print(data)
@@ -59,6 +70,14 @@ optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 y_true_onehot = F.one_hot(data.y, NUM_CLASSES).float()
 train_idx = data.train_mask.nonzero().view(-1)
 
+# Choose the hidden train nodes once; the same split is used every epoch.
+perm = train_idx[torch.randperm(train_idx.numel(), generator=torch.Generator().manual_seed(HIDE_SEED)).to(device)]
+num_hidden = max(1, min(train_idx.numel() - 1, round(HIDDEN_FRACTION * train_idx.numel())))
+hidden_idx = perm[:num_hidden]
+known_mask = data.train_mask.clone()
+known_mask[hidden_idx] = False
+print(f"Fixed split: {int(known_mask.sum())} clamped train nodes, {num_hidden} hidden train nodes")
+
 
 def infer(known_mask, create_graph):
     """Minimize the energy over the unknown nodes; return their logits [N, C].
@@ -80,13 +99,6 @@ def infer(known_mask, create_graph):
 def train():
     model.train()
     optimizer.zero_grad()
-
-    # Randomly hide part of the train nodes; the rest are clamped as known.
-    perm = train_idx[torch.randperm(train_idx.numel(), device=device)]
-    num_hidden = max(1, min(train_idx.numel() - 1, round(HIDDEN_FRACTION * train_idx.numel())))
-    hidden_idx = perm[:num_hidden]
-    known_mask = data.train_mask.clone()
-    known_mask[hidden_idx] = False
 
     logits = infer(known_mask, create_graph=True)
     loss = F.cross_entropy(logits[hidden_idx], data.y[hidden_idx])
@@ -138,9 +150,7 @@ train_accs = []
 val_accs = []
 test_losses = []
 test_accs = []
-best_val_loss = float("inf")
-best_epoch = None
-best_state = None
+stopper = EarlyStopping(args.patience)
 for epoch in range(1, EPOCHS + 1):
     loss, train_acc = train()
     val_acc, test_acc, val_loss, test_loss = test()
@@ -150,20 +160,21 @@ for epoch in range(1, EPOCHS + 1):
     val_accs.append(val_acc)
     test_losses.append(test_loss)
     test_accs.append(test_acc)
-    if val_loss < best_val_loss:
-        best_val_loss, best_epoch = val_loss, epoch
-        best_state = copy.deepcopy(model.state_dict())
     print(
         f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}"
     )
+    if stopper.step(val_loss, model, epoch):
+        break
 
-# Use the model from the epoch with the lowest validation loss (early stopping).
-if best_state is not None:
-    model.load_state_dict(best_state)
-    print(f"Restored model from epoch {best_epoch} (val loss {best_val_loss:.4f})")
+# Use the model from the epoch with the lowest validation loss.
+stopper.restore(model)
+best_epoch = stopper.best_epoch
 
 val_acc, test_acc, val_loss, test_loss = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
+report_results(
+    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
+    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch)
 
 predictions = evaluate().argmax(dim=-1)
 unlabeled_predictions = predictions[~data.train_mask]
@@ -183,10 +194,10 @@ for ax in (ax_loss, ax_acc):
     ax.legend()
     ax.grid(True, alpha=0.3)
 ax_loss.set_ylabel("Loss")
-ax_loss.set_title("Loss and accuracy vs epoch")
+ax_loss.set_title("Loss and accuracy vs epoch (fixed hidden train nodes)")
 ax_acc.set_ylabel("Accuracy")
 ax_acc.set_ylim(0, 1)
 ax_acc.set_xlabel("Epoch")
-plt.savefig("loss.png", dpi=150, bbox_inches="tight")
-print("Saved loss plot to loss.png")
+plt.savefig("loss_ebm.png", dpi=150, bbox_inches="tight")
+print("Saved loss plot to loss_ebm.png")
 plt.show()

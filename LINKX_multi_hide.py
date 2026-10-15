@@ -1,36 +1,36 @@
-"""Train EnergyBasedGNN for semi-supervised node classification.
+"""LINKX for semi-supervised node classification with multiple random hides.
 
-The model scores a full (soft) coloring y with a scalar energy E(x, y). Colors
-are predicted by minimizing E over the unknown nodes while the known nodes are
-clamped to their true one-hot labels:
-
-    z_0 = 0,   y_t = softmax(z_t) on unknown nodes, one-hot on known nodes
-    z_{t+1} = z_t - step_size * dE/dz_t
-
-Training unrolls this inference and backpropagates through it (end-to-end).
-FIXED-HIDE VARIANT: the train nodes are split once, before training: half are
-clamped as known, the other half are hidden, and the same split is used every
-epoch. The cross-entropy of the inferred colors on the hidden nodes is the
-loss. Val/test nodes are never clamped or used in the loss. At evaluation all
-train nodes are clamped and the rest are inferred.
+The known colors are given to LINKX as extra input channels: each node's
+input is [x, one-hot color] for clamped (known) nodes and [x, 0, 0, 0] for
+unknown nodes. Each epoch the train nodes are split at random: half are
+clamped as known, the other half are hidden (their color channels are zero)
+and the cross-entropy on the hidden nodes is the loss. Val/test nodes are never
+clamped or used in the loss. At evaluation all train nodes are clamped and the
+rest are predicted.
 """
 
-import copy
+import argparse
 import sys
 
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from model import EnergyBasedGNN
+from torch_geometric.nn import LINKX
+
+from model_utils import (EarlyStopping, add_early_stopping_arg,
+                         add_print_params_arg, print_params, report_results)
 
 torch.manual_seed(0)
 
 NUM_CLASSES = 3
 EPOCHS = 200
-INFERENCE_STEPS = 20
-STEP_SIZE = 1.0
-HIDDEN_FRACTION = 0.5  # share of train nodes hidden (predicted), fixed for all epochs
-HIDE_SEED = 0  # seed for the one-time choice of hidden train nodes
+HIDDEN_FRACTION = 0.5  # share of train nodes hidden (predicted) each epoch
+HIDE_SEED = 0  # seed for the per-epoch random hides, separate from the model's
+
+parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+add_print_params_arg(parser)
+add_early_stopping_arg(parser)
+args = parser.parse_args()
 
 data = torch.load("data/graph.pt", weights_only=False)
 print(data)
@@ -47,10 +47,14 @@ if int(data.train_mask.sum()) < 2:
     sys.exit("Error: need at least 2 labeled (train) nodes to train on.")
 
 
-model = EnergyBasedGNN(
-    num_node_features=data.num_node_features,
+model = LINKX(
+    num_nodes=data.num_nodes,
+    in_channels=data.num_node_features + NUM_CLASSES,
     hidden_channels=12,
-    num_classes=NUM_CLASSES,
+    num_layers=2,
+    out_channels=NUM_CLASSES,
+    num_node_layers=2,
+    num_edge_layers=2,
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,38 +64,27 @@ data.to(device)
 optimizer = torch.optim.Adam(model.parameters(), lr=0.01, weight_decay=5e-4)
 y_true_onehot = F.one_hot(data.y, NUM_CLASSES).float()
 train_idx = data.train_mask.nonzero().view(-1)
-
-# Choose the hidden train nodes once; the same split is used every epoch.
-perm = train_idx[torch.randperm(train_idx.numel(), generator=torch.Generator().manual_seed(HIDE_SEED)).to(device)]
-num_hidden = max(1, min(train_idx.numel() - 1, round(HIDDEN_FRACTION * train_idx.numel())))
-hidden_idx = perm[:num_hidden]
-known_mask = data.train_mask.clone()
-known_mask[hidden_idx] = False
-print(f"Fixed split: {int(known_mask.sum())} clamped train nodes, {num_hidden} hidden train nodes")
+hide_gen = torch.Generator().manual_seed(HIDE_SEED)
 
 
-def infer(known_mask, create_graph):
-    """Minimize the energy over the unknown nodes; return their logits [N, C].
-
-    With create_graph=True the steps stay differentiable w.r.t. the model
-    parameters (for training); otherwise each step is detached (for evaluation).
-    """
-    z = torch.zeros(data.num_nodes, NUM_CLASSES, device=device, requires_grad=True)
-    for _ in range(INFERENCE_STEPS):
-        y = torch.where(known_mask.unsqueeze(-1), y_true_onehot, z.softmax(dim=-1))
-        energy = model(data.x, data.edge_index, y)
-        (grad,) = torch.autograd.grad(energy, z, create_graph=create_graph)
-        z = z - STEP_SIZE * grad
-        if not create_graph:
-            z = z.detach().requires_grad_()
-    return z
+def forward(known_mask):
+    """Run LINKX with the colors of `known_mask` nodes given as input."""
+    label_input = y_true_onehot * known_mask.unsqueeze(-1)
+    return model(torch.cat([data.x, label_input], dim=-1), data.edge_index)
 
 
 def train():
     model.train()
     optimizer.zero_grad()
 
-    logits = infer(known_mask, create_graph=True)
+    # Randomly hide part of the train nodes; the rest are clamped as known.
+    perm = train_idx[torch.randperm(train_idx.numel(), generator=hide_gen).to(device)]
+    num_hidden = max(1, min(train_idx.numel() - 1, round(HIDDEN_FRACTION * train_idx.numel())))
+    hidden_idx = perm[:num_hidden]
+    known_mask = data.train_mask.clone()
+    known_mask[hidden_idx] = False
+
+    logits = forward(known_mask)
     loss = F.cross_entropy(logits[hidden_idx], data.y[hidden_idx])
     loss.backward()
     optimizer.step()
@@ -115,11 +108,11 @@ def masked_loss(logits, mask):
     return F.cross_entropy(logits[mask], data.y[mask]).item()
 
 
+@torch.no_grad()
 def evaluate():
-    """Clamp all train nodes, infer the rest; return logits for every node."""
+    """Clamp all train nodes, predict the rest; return logits for every node."""
     model.eval()
-    with torch.enable_grad():  # inference needs dE/dy even at evaluation time
-        return infer(data.train_mask, create_graph=False).detach()
+    return forward(data.train_mask)
 
 
 def test():
@@ -141,9 +134,7 @@ train_accs = []
 val_accs = []
 test_losses = []
 test_accs = []
-best_val_loss = float("inf")
-best_epoch = None
-best_state = None
+stopper = EarlyStopping(args.patience)
 for epoch in range(1, EPOCHS + 1):
     loss, train_acc = train()
     val_acc, test_acc, val_loss, test_loss = test()
@@ -153,24 +144,28 @@ for epoch in range(1, EPOCHS + 1):
     val_accs.append(val_acc)
     test_losses.append(test_loss)
     test_accs.append(test_acc)
-    if val_loss < best_val_loss:
-        best_val_loss, best_epoch = val_loss, epoch
-        best_state = copy.deepcopy(model.state_dict())
     print(
         f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}"
     )
+    if stopper.step(val_loss, model, epoch):
+        break
 
-# Use the model from the epoch with the lowest validation loss (early stopping).
-if best_state is not None:
-    model.load_state_dict(best_state)
-    print(f"Restored model from epoch {best_epoch} (val loss {best_val_loss:.4f})")
+# Use the model from the epoch with the lowest validation loss.
+stopper.restore(model)
+best_epoch = stopper.best_epoch
 
 val_acc, test_acc, val_loss, test_loss = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
+report_results(
+    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
+    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch)
 
 predictions = evaluate().argmax(dim=-1)
 unlabeled_predictions = predictions[~data.train_mask]
 print("Predictions for unlabeled nodes:", unlabeled_predictions)
+
+if args.print_params:
+    print_params(model)
 
 epochs = range(1, len(losses) + 1)
 fig, (ax_loss, ax_acc) = plt.subplots(2, 1, sharex=True, figsize=(7, 8))
@@ -186,10 +181,10 @@ for ax in (ax_loss, ax_acc):
     ax.legend()
     ax.grid(True, alpha=0.3)
 ax_loss.set_ylabel("Loss")
-ax_loss.set_title("Loss and accuracy vs epoch (fixed hidden train nodes)")
+ax_loss.set_title("LINKX (multiple hides): loss and accuracy vs epoch")
 ax_acc.set_ylabel("Accuracy")
 ax_acc.set_ylim(0, 1)
 ax_acc.set_xlabel("Epoch")
-plt.savefig("loss_fixed_hide.png", dpi=150, bbox_inches="tight")
-print("Saved loss plot to loss_fixed_hide.png")
+plt.savefig("loss_LINKX_multi_hide.png", dpi=150, bbox_inches="tight")
+print("Saved loss plot to loss_LINKX_multi_hide.png")
 plt.show()

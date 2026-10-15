@@ -1,0 +1,15 @@
+{
+  "variable": {"name": "num_edges", "values": [1200, 2400, 3600, 4800, 6000, 12000, 18000, 30000, 60000, 90000]},
+  "fixed": {
+    "num_nodes": 2400,
+    "node_weights": [1, 1, 1],
+    "edge_weights": [1, 1, 1],
+    "train_frac": 0.5,
+    "val_frac": 0.25,
+    "num_features": 8,
+    "feature_type": "random",
+    "seed": 0
+  },
+  "model": "GCN_multi_hide.py",
+  "model_args": ["--patience", "50"]
+}

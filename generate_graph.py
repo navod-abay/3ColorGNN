@@ -44,10 +44,20 @@ from torch_geometric.data import Data
 COLORS = (0, 1, 2)
 PAIRS = ((0, 1), (0, 2), (1, 2))
 
+# Defaults used when the user presses Enter at a prompt.
+DEFAULT_NUM_NODES = 1000
+DEFAULT_NUM_EDGES = 2200
+DEFAULT_NODE_WEIGHTS = "1 1 1"
+DEFAULT_EDGE_WEIGHTS = "1 1 1"
+DEFAULT_TRAIN_FRAC = 0.5
+DEFAULT_VAL_FRAC = 0.25
 
-def prompt_int(msg, minimum=0):
+
+def prompt_int(msg, minimum=0, default=None):
     while True:
         raw = input(msg).strip()
+        if not raw and default is not None:
+            return default
         try:
             value = int(raw)
         except ValueError:
@@ -76,10 +86,11 @@ def prompt_float(msg, default, maximum=1.0):
         return value
 
 
-def prompt_weights(msg, count):
+def prompt_weights(msg, count, default=None):
     """Read `count` non-negative numbers (space/comma separated) and normalize them."""
     while True:
-        raw = input(msg).replace(",", " ").split()
+        raw = input(msg).strip() or (default or "")
+        raw = raw.replace(",", " ").split()
         try:
             weights = [float(x) for x in raw]
         except ValueError:
@@ -255,15 +266,20 @@ def to_data(graph, train_frac, val_frac, num_features, feature_type, noise_std):
 
 def main():
     print("=== 3-colorable graph generator ===")
-    num_nodes = prompt_int("Number of nodes: ", minimum=1)
-    num_edges = prompt_int("Number of edges: ", minimum=0)
+    num_nodes = prompt_int(
+        f"Number of nodes [{DEFAULT_NUM_NODES}]: ", minimum=1, default=DEFAULT_NUM_NODES)
+    num_edges = prompt_int(
+        f"Number of edges [{DEFAULT_NUM_EDGES}]: ", minimum=0, default=DEFAULT_NUM_EDGES)
     node_weights = prompt_weights(
-        "Node weights for colors 0 1 2 (e.g. '1 1 1'): ", 3)
+        f"Node weights for colors 0 1 2 [{DEFAULT_NODE_WEIGHTS}]: ", 3, DEFAULT_NODE_WEIGHTS)
     edge_weights = prompt_weights(
-        "Edge weights for color pairs 0-1 0-2 1-2 (e.g. '1 1 1'): ", 3)
-    train_frac = prompt_float("Fraction of labeled (train) nodes [0.1]: ", 0.1)
+        f"Edge weights for color pairs 0-1 0-2 1-2 [{DEFAULT_EDGE_WEIGHTS}]: ", 3,
+        DEFAULT_EDGE_WEIGHTS)
+    train_frac = prompt_float(
+        f"Fraction of labeled (train) nodes [{DEFAULT_TRAIN_FRAC}]: ", DEFAULT_TRAIN_FRAC)
+    val_default = min(DEFAULT_VAL_FRAC, 1 - train_frac)
     val_frac = prompt_float(
-        "Fraction of validation nodes [0.1]: ", min(0.1, 1 - train_frac), 1 - train_frac)
+        f"Fraction of validation nodes [{val_default:g}]: ", val_default, 1 - train_frac)
     num_features = prompt_int("Number of node features: ", minimum=1)
     print("Feature type:\n  1) Random values\n"
           "  2) Orthogonal vector per color + noise per node")

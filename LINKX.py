@@ -1,10 +1,17 @@
+import argparse
 import sys
 
 import matplotlib.pyplot as plt
 import torch
 from torch_geometric.nn import LINKX
 
+from model_utils import EarlyStopping, add_early_stopping_arg, report_results
+
 torch.manual_seed(0)
+
+parser = argparse.ArgumentParser(description="Train LINKX for node classification.")
+add_early_stopping_arg(parser)
+args = parser.parse_args()
 
 data = torch.load("data/graph.pt", weights_only=False)
 print(data)
@@ -25,8 +32,8 @@ if int(data.train_mask.sum()) == 0:
 model = LINKX(
     num_nodes=data.num_nodes,
     in_channels=data.num_node_features,
-    hidden_channels=12,
-    num_layers=12,
+    hidden_channels=8,
+    num_layers=2,
     out_channels=3,
     num_node_layers=3,
     num_edge_layers=3,
@@ -77,6 +84,7 @@ def test():
 
 losses = []
 val_losses = []
+stopper = EarlyStopping(args.patience)
 for epoch in range(1, 201):
     loss = train()
     train_acc, val_acc, test_acc, val_loss = test()
@@ -85,6 +93,15 @@ for epoch in range(1, 201):
     print(
         f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}"
     )
+    if stopper.step(val_loss, model, epoch):
+        break
+
+# Use the model from the epoch with the lowest validation loss.
+stopper.restore(model)
+train_acc, val_acc, test_acc, val_loss = test()
+print(f"Final: Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
+report_results(train_acc=train_acc, val_acc=val_acc, test_acc=test_acc,
+               best_epoch=stopper.best_epoch)
 
 model.eval()
 with torch.no_grad():
@@ -97,11 +114,14 @@ print("Predictions for unlabeled nodes:", unlabeled_predictions)
 epochs = range(1, len(losses) + 1)
 plt.plot(epochs, losses, label="Training loss")
 plt.plot(epochs, val_losses, label="Validation loss")
+if stopper.best_epoch is not None:
+    plt.axvline(stopper.best_epoch, color="gray", linestyle="--",
+                label=f"Best epoch ({stopper.best_epoch})")
 plt.xlabel("Epoch")
 plt.ylabel("Loss")
 plt.legend()
 plt.title("Loss vs epoch")
 plt.grid(True, alpha=0.3)
-plt.savefig("loss.png", dpi=150, bbox_inches="tight")
-print("Saved loss plot to loss.png")
+plt.savefig("loss_LINKX.png", dpi=150, bbox_inches="tight")
+print("Saved loss plot to loss_LINKX.png")
 plt.show()
