@@ -34,6 +34,8 @@ Output is a torch_geometric.data.Data object saved with torch.save:
 Load it with torch.load(path, weights_only=False).
 """
 
+import argparse
+import math
 import os
 import random
 import sys
@@ -43,6 +45,11 @@ from torch_geometric.data import Data
 
 COLORS = (0, 1, 2)
 PAIRS = ((0, 1), (0, 2), (1, 2))
+VISUALIZE_MAX_NODES = 20  # --visualize is ignored for bigger graphs
+PLOT_COLORS = ("#E0524A", "#43A85B", "#3F7FD9")  # red, green, blue for classes 0, 1, 2
+PLOT_COLOR_NAMES = ("Red", "Green", "Blue")
+LAYOUT_TRIES = 50  # candidate layouts snapped to the grid for the drawing
+LAYOUT_REFINE = 3  # how many of the best candidates are refined by local search
 
 # Defaults used when the user presses Enter at a prompt.
 DEFAULT_NUM_NODES = 1000
@@ -264,7 +271,167 @@ def to_data(graph, train_frac, val_frac, num_features, feature_type, noise_std):
     return data
 
 
+def _orient(a, b, c):
+    """Sign of the turn a -> b -> c: 1 left, -1 right, 0 collinear."""
+    cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    return (cross > 0) - (cross < 0)
+
+
+def _on_segment(a, b, c):
+    """For collinear a, b, c: is c within the segment a-b?"""
+    return min(a[0], b[0]) <= c[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= c[1] <= max(a[1], b[1])
+
+
+def _dist2(a, b):
+    return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+
+
+def _layout_problems(edges, pos):
+    """Return (edges passing through another node, pairs of crossing edges)."""
+    through = sum(
+        1 for u, v in edges for w, p in pos.items()
+        if w not in (u, v) and _orient(pos[u], pos[v], p) == 0 and _on_segment(pos[u], pos[v], p))
+    crossings = 0
+    for i, (a, b) in enumerate(edges):
+        for c, d in edges[i + 1:]:
+            pa, pb, pc, pd = pos[a], pos[b], pos[c], pos[d]
+            if {a, b} & {c, d}:
+                # Edges sharing an endpoint only clash if they overlap along one line.
+                shared = ({a, b} & {c, d}).pop()
+                x, y = (b if a == shared else a), (d if c == shared else c)
+                s = pos[shared]
+                if _orient(s, pos[x], pos[y]) == 0 and (
+                        _on_segment(s, pos[x], pos[y]) or _on_segment(s, pos[y], pos[x])):
+                    crossings += 1
+                continue
+            o1, o2 = _orient(pa, pb, pc), _orient(pa, pb, pd)
+            o3, o4 = _orient(pc, pd, pa), _orient(pc, pd, pb)
+            if (o1 != o2 and o3 != o4) or \
+               (o1 == 0 and _on_segment(pa, pb, pc)) or (o2 == 0 and _on_segment(pa, pb, pd)) or \
+               (o3 == 0 and _on_segment(pc, pd, pa)) or (o4 == 0 and _on_segment(pc, pd, pb)):
+                crossings += 1
+    return through, crossings
+
+
+def grid_layout(num_nodes, edges, seed):
+    """Place nodes on a square grid with as few edge crossings as possible.
+
+    Like the 3Color puzzle game (archada.itch.io/3color), nodes sit on grid
+    points and edges are straight lines. Many spring layouts (and a planar
+    layout, when the graph is planar) are snapped to the grid. The best few are
+    then improved by moving single nodes to free grid points or swapping two
+    nodes, as long as that helps. A layout is better if fewer edges pass
+    through a node, then if fewer edges cross, then if edges are shorter.
+    Returns (positions, number of crossings).
+    """
+    import networkx as nx
+
+    g = nx.Graph()
+    g.add_nodes_from(range(num_nodes))
+    g.add_edges_from(edges)
+    side = math.isqrt(num_nodes - 1) + 2 if num_nodes > 1 else 1
+    points = [(x, y) for y in range(side) for x in range(side)]
+
+    def score(pos):
+        through, crossings = _layout_problems(edges, pos)
+        return through, crossings, sum(math.dist(pos[u], pos[v]) for u, v in edges)
+
+    def snap(raw):
+        """Move each node to a grid point near its position in `raw`."""
+        xs, ys = [raw[v][0] for v in g], [raw[v][1] for v in g]
+        scale = lambda t, lo, hi: (t - lo) / (hi - lo) * (side - 1) if hi > lo else (side - 1) / 2
+        target = {v: (scale(raw[v][0], min(xs), max(xs)), scale(raw[v][1], min(ys), max(ys)))
+                  for v in g}
+        # Greedy: closest (node, grid point) pairs first.
+        pairs = sorted((_dist2(target[v], p), v, p) for v in g for p in points)
+        pos, used = {}, set()
+        for _, v, p in pairs:
+            if v not in pos and p not in used:
+                pos[v] = p
+                used.add(p)
+        return pos
+
+    def improve(pos, current):
+        """Hill-climb: move a node to another grid point (swapping if taken)."""
+        at = {p: v for v, p in pos.items()}
+        improved = True
+        while improved and current[:2] != (0, 0):
+            improved = False
+            for v in list(pos):
+                for p in points:
+                    old, w = pos[v], at.get(p)
+                    if p == old:
+                        continue
+                    pos[v] = p
+                    if w is not None:
+                        pos[w] = old
+                    new = score(pos)
+                    if new < current:
+                        current, improved = new, True
+                        at[p] = v
+                        if w is not None:
+                            at[old] = w
+                        else:
+                            del at[old]
+                    else:
+                        pos[v] = old
+                        if w is not None:
+                            pos[w] = p
+        return pos, current
+
+    raws = [nx.spring_layout(g, seed=seed + t) for t in range(LAYOUT_TRIES)]
+    if nx.check_planarity(g)[0]:
+        raws.append(nx.planar_layout(g))
+    snapped = sorted(((score(pos), i, pos) for i, pos in enumerate(map(snap, raws))),
+                     key=lambda c: c[:2])
+    best_pos, best_score = None, None
+    for start_score, _, pos in snapped[:LAYOUT_REFINE]:
+        pos, s = improve(dict(pos), start_score)
+        if best_score is None or s < best_score:
+            best_pos, best_score = pos, s
+    return best_pos, best_score[1]
+
+
+def visualize(graph, path):
+    """Draw the graph on a grid with each node in its color and save it to `path`."""
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    edges = [tuple(e) for e in graph["edges"]]
+    pos, crossings = grid_layout(graph["num_nodes"], edges, graph["seed"])
+
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for u, v in edges:
+        ax.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]], color="#8C8C8C",
+                linewidth=1.8, zorder=1)
+    for v, (x, y) in pos.items():
+        ax.scatter(x, y, s=900, color=PLOT_COLORS[graph["colors"][v]],
+                   edgecolors="#2A2A2A", linewidths=1.2, zorder=2)
+        ax.text(x, y, str(v), ha="center", va="center", color="#FFFFFF",
+                fontweight="bold", fontsize=11, zorder=3)
+    ax.legend(handles=[Line2D([], [], marker="o", linestyle="", markersize=12,
+                              markerfacecolor=PLOT_COLORS[c], markeredgecolor="#2A2A2A",
+                              label=f"{PLOT_COLOR_NAMES[c]} (color {c})") for c in COLORS],
+              loc="upper left", bbox_to_anchor=(1.0, 1.0))
+    ax.set_title(f"3-colored graph: {graph['num_nodes']} nodes, {len(edges)} edges")
+    ax.set_aspect("equal")
+    ax.margins(0.12)
+    ax.axis("off")
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    print(f"Saved visualization to {path}")
+    if crossings:
+        print(f"Note: the drawing has {crossings} edge crossing(s); "
+              "this graph may not be drawable without crossings.")
+    plt.show()
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--visualize", action="store_true",
+                        help="draw the graph with each node in its color "
+                             f"(ignored above {VISUALIZE_MAX_NODES} nodes)")
+    args = parser.parse_args()
+
     print("=== 3-colorable graph generator ===")
     num_nodes = prompt_int(
         f"Number of nodes [{DEFAULT_NUM_NODES}]: ", minimum=1, default=DEFAULT_NUM_NODES)
@@ -315,6 +482,13 @@ def main():
     components = count_components(graph["num_nodes"], graph["edges"])
     if components > 1:
         print(f"Note: the generated graph is not connected ({components} components).")
+
+    if args.visualize:
+        if graph["num_nodes"] > VISUALIZE_MAX_NODES:
+            print(f"Skipping --visualize: the graph has {graph['num_nodes']} nodes "
+                  f"(limit is {VISUALIZE_MAX_NODES}).")
+        else:
+            visualize(graph, os.path.splitext(out_path)[0] + ".png")
 
 
 if __name__ == "__main__":

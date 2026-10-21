@@ -18,7 +18,8 @@ import torch.nn.functional as F
 from torch_geometric.nn import LINKX
 
 from model_utils import (EarlyStopping, add_early_stopping_arg,
-                         add_print_params_arg, print_params, report_results)
+                         add_print_params_arg, coloring_violations, print_params,
+                         report_results)
 
 torch.manual_seed(0)
 
@@ -156,13 +157,15 @@ best_epoch = stopper.best_epoch
 
 val_acc, test_acc, val_loss, test_loss = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
-report_results(
-    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
-    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch)
 
 predictions = evaluate().argmax(dim=-1)
 unlabeled_predictions = predictions[~data.train_mask]
 print("Predictions for unlabeled nodes:", unlabeled_predictions)
+
+violations = coloring_violations(predictions, data.y, data.edge_index, data.train_mask)
+report_results(
+    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
+    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch, **violations)
 
 if args.print_params:
     print_params(model)

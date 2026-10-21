@@ -44,6 +44,28 @@ def report_results(**metrics):
     print(RESULTS_PREFIX + json.dumps(metrics))
 
 
+def coloring_violations(pred, y, edge_index, known_mask):
+    """Count edges whose two endpoints get the same color in the final coloring.
+
+    The final coloring gives known nodes (`known_mask`, the train nodes) their
+    true color `y` and every other node its predicted color `pred`. Edges
+    between two known nodes can never violate, so the rate is taken over the
+    edges that touch at least one predicted node. `edge_index` may list each
+    undirected edge in both directions; each edge is counted once.
+    Prints a summary and returns the counts as a dict for report_results.
+    """
+    colors = torch.where(known_mask, y, pred)
+    src, dst = edge_index
+    once = src < dst
+    src, dst = src[once], dst[once]
+    violations = int((colors[src] == colors[dst]).sum())
+    checked = int((~(known_mask[src] & known_mask[dst])).sum())
+    rate = violations / checked if checked else float("nan")
+    print(f"Coloring violations: {violations} of {checked} edges touching a predicted node "
+          f"({rate:.2%}); {int(once.sum())} edges in total")
+    return {"violations": violations, "checked_edges": checked, "violation_rate": rate}
+
+
 def add_early_stopping_arg(parser, default=DEFAULT_PATIENCE):
     """Add the --patience flag (0 disables early stopping) to an argparse parser."""
     parser.add_argument("--patience", type=int, default=default,

@@ -25,17 +25,25 @@ Generation settings (anything not in "fixed" uses the default shown):
     val_frac      0.25
 
 Each run is saved under runs/<timestamp>/<variable>_<value>/: the graph in
-data/graph.pt, the model's log (train.log) and its loss plot.
+data/graph.pt, the model's log (train.log) and its loss plot. The batch folder
+also holds results.csv and accuracy_vs_<variable>.png, a plot of train, val
+and test accuracy against the variable (numeric values at their actual
+positions on the x axis, lists and text evenly spaced in config order).
 """
 
 import argparse
 import csv
 import json
+import math
 import os
 import subprocess
 import sys
 from datetime import datetime
 
+import matplotlib
+
+matplotlib.use("Agg")  # save the plot to a file; never open a window mid-batch
+import matplotlib.pyplot as plt
 import torch
 
 import generate_graph as gen
@@ -110,6 +118,40 @@ def run_model(model, run_dir, model_args):
     return json.loads(lines[-1][len(RESULTS_PREFIX):]), "ok"
 
 
+def plot_accuracies(rows, var, model, path):
+    """Plot train/val/test accuracy against the variable and save it to `path`.
+
+    Numeric variables are placed at their actual values on the x axis, so the
+    spacing is proportional. Lists and text are evenly spaced in config order.
+    Skipped or failed values appear as gaps.
+    """
+    numeric = all(isinstance(r["value"], (int, float)) and not isinstance(r["value"], bool)
+                  for r in rows)
+    if numeric:
+        rows = sorted(rows, key=lambda r: r["value"])
+        positions = [r["value"] for r in rows]
+    else:
+        positions = list(range(len(rows)))
+
+    fig, ax = plt.subplots(figsize=(max(7, 0.9 * len(rows)), 5))
+    for key, label in (("train_acc", "Train"), ("val_acc", "Validation"), ("test_acc", "Test")):
+        ys = [r.get(key, math.nan) for r in rows]
+        ax.plot(positions, ys, marker="o", label=f"{label} accuracy")
+    if not numeric:
+        ax.set_xticks(positions)
+        ax.set_xticklabels([str(r["value"]) for r in rows],
+                           rotation=30 if len(rows) > 6 else 0,
+                           ha="right" if len(rows) > 6 else "center")
+    ax.set_xlabel(var)
+    ax.set_ylabel("Accuracy")
+    ax.set_ylim(0, 1)
+    ax.set_title(f"{model}: accuracy vs {var}")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def fmt(x):
     return "-" if x is None else (f"{x:.4f}" if isinstance(x, float) else str(x))
 
@@ -158,10 +200,11 @@ def main():
         print("Training ...", end=" ", flush=True)
         metrics, status = run_model(model, run_dir, model_args)
         print(status if metrics is None else
-              "  ".join(f"{k}={metrics[k]:.4f}" for k in METRICS))
+              "  ".join(f"{k}={metrics[k]:.4f}" for k in METRICS)
+              + f"  violations={metrics.get('violations', '-')}")
         rows.append({"value": value, "status": status, **(metrics or {})})
 
-    columns = ["value", *METRICS, "best_epoch", "status"]
+    columns = ["value", *METRICS, "violations", "violation_rate", "best_epoch", "status"]
     csv_path = os.path.join(batch_dir, "results.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[var if c == "value" else c for c in columns])
@@ -169,7 +212,7 @@ def main():
         for r in rows:
             writer.writerow({(var if c == "value" else c): r.get(c, "") for c in columns})
 
-    headers = [var, *METRICS, "best_epoch", "status"]
+    headers = [var, *METRICS, "violations", "violation_rate", "best_epoch", "status"]
     # Keep the table narrow: full skip/failure reasons are printed above and in the CSV.
     table = [[fmt(r.get(c)) for c in columns[:-1]] + [r["status"].split(":")[0]] for r in rows]
     widths = [max(len(h), *(len(t[i]) for t in table)) for i, h in enumerate(headers)]
@@ -179,6 +222,10 @@ def main():
     for t in table:
         print("  ".join(c.ljust(w) for c, w in zip(t, widths)))
     print(f"\nSaved results to {os.path.relpath(csv_path, REPO_ROOT)}")
+
+    plot_path = os.path.join(batch_dir, f"accuracy_vs_{var}.png")
+    plot_accuracies(rows, var, model, plot_path)
+    print(f"Saved accuracy plot to {os.path.relpath(plot_path, REPO_ROOT)}")
 
 
 if __name__ == "__main__":

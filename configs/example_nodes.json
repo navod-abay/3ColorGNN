@@ -1,8 +1,8 @@
 {
-  "variable": {"name": "num_edges", "values": [1200, 2400, 3600, 4800, 6000, 12000, 18000, 30000, 60000, 90000]},
+  "variable": {"name": "node_weights", "values": [[1, 1, 1], [10, 10, 11], [10, 10, 12], [2, 2, 3], [1, 1, 2], [1, 1, 3]]},
   "fixed": {
     "num_nodes": 2400,
-    "node_weights": [1, 1, 1],
+    "num_edges": 9000,
     "edge_weights": [1, 1, 1],
     "train_frac": 0.5,
     "val_frac": 0.25,

@@ -5,7 +5,8 @@ import matplotlib.pyplot as plt
 import torch
 from torch_geometric.nn import LINKX
 
-from model_utils import EarlyStopping, add_early_stopping_arg, report_results
+from model_utils import (EarlyStopping, add_early_stopping_arg, coloring_violations,
+                         report_results)
 
 torch.manual_seed(0)
 
@@ -100,8 +101,6 @@ for epoch in range(1, 201):
 stopper.restore(model)
 train_acc, val_acc, test_acc, val_loss = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
-report_results(train_acc=train_acc, val_acc=val_acc, test_acc=test_acc,
-               best_epoch=stopper.best_epoch)
 
 model.eval()
 with torch.no_grad():
@@ -110,6 +109,10 @@ with torch.no_grad():
 
 unlabeled_predictions = predictions[~data.train_mask]
 print("Predictions for unlabeled nodes:", unlabeled_predictions)
+
+violations = coloring_violations(predictions, data.y, data.edge_index, data.train_mask)
+report_results(train_acc=train_acc, val_acc=val_acc, test_acc=test_acc,
+               best_epoch=stopper.best_epoch, **violations)
 
 epochs = range(1, len(losses) + 1)
 plt.plot(epochs, losses, label="Training loss")

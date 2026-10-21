@@ -25,7 +25,8 @@ from model import EnergyBasedGNN
 
 # The shared helpers live in the repo root, one folder up.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from model_utils import EarlyStopping, add_early_stopping_arg, report_results  # noqa: E402
+from model_utils import (EarlyStopping, add_early_stopping_arg,  # noqa: E402
+                         coloring_violations, report_results)
 
 torch.manual_seed(0)
 
@@ -169,13 +170,15 @@ best_epoch = stopper.best_epoch
 
 val_acc, test_acc, val_loss, test_loss = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
-report_results(
-    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
-    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch)
 
 predictions = evaluate().argmax(dim=-1)
 unlabeled_predictions = predictions[~data.train_mask]
 print("Predictions for unlabeled nodes:", unlabeled_predictions)
+
+violations = coloring_violations(predictions, data.y, data.edge_index, data.train_mask)
+report_results(
+    train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
+    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch, **violations)
 
 epochs = range(1, len(losses) + 1)
 fig, (ax_loss, ax_acc) = plt.subplots(2, 1, sharex=True, figsize=(7, 8))
