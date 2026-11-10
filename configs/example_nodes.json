@@ -1,15 +1,91 @@
 {
-  "variable": {"name": "node_weights", "values": [[1, 1, 1], [10, 10, 11], [10, 10, 12], [2, 2, 3], [1, 1, 2], [1, 1, 3]]},
+  "variable": {
+    "name": "node_weights",
+    "values": [
+      [
+        1,
+        1,
+        1
+      ],
+      [
+        10,
+        10,
+        11
+      ],
+      [
+        10,
+        10,
+        12
+      ],
+      [
+        2,
+        2,
+        3
+      ],
+      [
+        1,
+        1,
+        2
+      ],
+      [
+        1,
+        1,
+        3
+      ],
+      [
+        1,
+        1,
+        4
+      ],
+      [
+        1,
+        1,
+        5
+      ],
+            [
+        1,
+        1,
+        6
+      ],
+            [
+        1,
+        1,
+        7
+      ],
+            [
+        1,
+        1,
+        8
+      ],
+            [
+        1,
+        1,
+        9
+      ],
+            [
+        1,
+        1,
+        10
+      ]
+    ]
+  },
   "fixed": {
-    "num_nodes": 2400,
-    "num_edges": 9000,
-    "edge_weights": [1, 1, 1],
+    "num_nodes": 1000,
+    "num_edges": 6000,
+    "edge_weights": [
+      1,
+      1,
+      1
+    ],
     "train_frac": 0.5,
     "val_frac": 0.25,
     "num_features": 8,
     "feature_type": "random",
-    "seed": 0
+    "seed": 42
   },
   "model": "GCN_multi_hide.py",
-  "model_args": ["--patience", "50"]
+  "model_args": [
+    "--patience",
+    "50"
+  ]
 }

@@ -21,12 +21,12 @@ import sys
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
-from model import EnergyBasedGNN
+from nodeOnlyModel import EnergyBasedGNN
 
 # The shared helpers live in the repo root, one folder up.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from model_utils import (EarlyStopping, add_early_stopping_arg,  # noqa: E402
-                         coloring_violations, report_results)
+                         coloring_violations, split_metrics, report_results)
 
 torch.manual_seed(0)
 
@@ -104,7 +104,8 @@ def train():
     optimizer.step()
 
     train_acc = (logits[hidden_idx].argmax(dim=-1) == data.y[hidden_idx]).float().mean().item()
-    return loss.item(), train_acc
+    train_scores = split_metrics(logits[hidden_idx].argmax(dim=-1), data.y[hidden_idx], "train")
+    return loss.item(), train_acc, train_scores
 
 
 def accuracy(pred, mask):
@@ -139,27 +140,35 @@ def test():
     val_loss = masked_loss(logits, data.val_mask)
     test_loss = masked_loss(logits, data.test_mask)
 
-    return val_acc, test_acc, val_loss, test_loss
+    # Same coloring as the final report: train nodes clamped, the rest predicted.
+    violation_ratio = coloring_violations(pred, data.y, data.edge_index, data.train_mask,
+                                          verbose=False)["violation_ratio"]
+
+    return val_acc, test_acc, val_loss, test_loss, violation_ratio
 
 
 losses = []
 val_losses = []
 train_accs = []
+train_scores_per_epoch = []
 val_accs = []
 test_losses = []
 test_accs = []
+violation_ratios = []
 stopper = EarlyStopping(args.patience)
 for epoch in range(1, EPOCHS + 1):
-    loss, train_acc = train()
-    val_acc, test_acc, val_loss, test_loss = test()
+    loss, train_acc, train_scores = train()
+    val_acc, test_acc, val_loss, test_loss, violation_ratio = test()
     losses.append(loss)
     val_losses.append(val_loss)
     train_accs.append(train_acc)
+    train_scores_per_epoch.append(train_scores)
     val_accs.append(val_acc)
     test_losses.append(test_loss)
     test_accs.append(test_acc)
+    violation_ratios.append(violation_ratio)
     print(
-        f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}"
+        f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}, Violation Ratio: {violation_ratio:.4f}"
     )
     if stopper.step(val_loss, model, epoch):
         break
@@ -168,7 +177,7 @@ for epoch in range(1, EPOCHS + 1):
 stopper.restore(model)
 best_epoch = stopper.best_epoch
 
-val_acc, test_acc, val_loss, test_loss = test()
+val_acc, test_acc, val_loss, test_loss, _ = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
 
 predictions = evaluate().argmax(dim=-1)
@@ -178,26 +187,38 @@ print("Predictions for unlabeled nodes:", unlabeled_predictions)
 violations = coloring_violations(predictions, data.y, data.edge_index, data.train_mask)
 report_results(
     train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
-    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch, **violations)
+    val_acc=val_acc, test_acc=test_acc,
+    **(train_scores_per_epoch[best_epoch - 1] if best_epoch is not None else {}),
+    **split_metrics(predictions[data.val_mask], data.y[data.val_mask], "val"),
+    **split_metrics(predictions[data.test_mask], data.y[data.test_mask], "test"),
+    best_epoch=best_epoch, **violations)
 
 epochs = range(1, len(losses) + 1)
-fig, (ax_loss, ax_acc) = plt.subplots(2, 1, sharex=True, figsize=(7, 8))
+fig, (ax_loss, ax_acc, ax_viol) = plt.subplots(3, 1, sharex=True, figsize=(7, 11))
 ax_loss.plot(epochs, losses, label="Training loss (hidden train nodes)")
 ax_loss.plot(epochs, val_losses, label="Validation loss")
 ax_loss.plot(epochs, test_losses, label="Test loss")
-ax_acc.plot(epochs, train_accs, label="Training accuracy (hidden train nodes)")
-ax_acc.plot(epochs, val_accs, label="Validation accuracy")
-ax_acc.plot(epochs, test_accs, label="Test accuracy")
-for ax in (ax_loss, ax_acc):
+for accs, label in ((train_accs, "Training accuracy (hidden train nodes)"),
+                    (val_accs, "Validation accuracy"), (test_accs, "Test accuracy")):
+    if best_epoch is not None:
+        label += f": {accs[best_epoch - 1]:.3f} at best epoch"
+    (line,) = ax_acc.plot(epochs, accs, label=label)
+    if best_epoch is not None:  # mark the value the restored model reports
+        ax_acc.plot(best_epoch, accs[best_epoch - 1], "o", color=line.get_color())
+ax_viol.plot(epochs, violation_ratios, color="tab:red",
+             label="Coloring violations / total edges")
+for ax in (ax_loss, ax_acc, ax_viol):
     if best_epoch is not None:
         ax.axvline(best_epoch, color="gray", linestyle="--", label=f"Best epoch ({best_epoch})")
     ax.legend()
     ax.grid(True, alpha=0.3)
 ax_loss.set_ylabel("Loss")
-ax_loss.set_title("Loss and accuracy vs epoch (multiple hides)")
+ax_loss.set_title("Loss, accuracy and violation ratio vs epoch (multiple hides)")
 ax_acc.set_ylabel("Accuracy")
 ax_acc.set_ylim(0, 1)
-ax_acc.set_xlabel("Epoch")
+ax_viol.set_ylabel("Violation ratio")
+ax_viol.set_ylim(bottom=0)
+ax_viol.set_xlabel("Epoch")
 plt.savefig("loss_ebm_multi_hide.png", dpi=150, bbox_inches="tight")
-print("Saved loss plot to loss_ebm_multi_hide.png")
+print("Saved loss/accuracy/violations plot to loss_ebm_multi_hide.png")
 plt.show()

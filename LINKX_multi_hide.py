@@ -7,6 +7,9 @@ clamped as known, the other half are hidden (their color channels are zero)
 and the cross-entropy on the hidden nodes is the loss. Val/test nodes are never
 clamped or used in the loss. At evaluation all train nodes are clamped and the
 rest are predicted.
+
+With --degree-hist, a histogram of the test nodes' degrees is also saved, with
+the misclassified test nodes' degrees drawn on top of it in the same figure.
 """
 
 import argparse
@@ -14,11 +17,12 @@ import sys
 
 import matplotlib.pyplot as plt
 import torch
+from matplotlib.ticker import MaxNLocator
 import torch.nn.functional as F
 from torch_geometric.nn import LINKX
 
 from model_utils import (EarlyStopping, add_early_stopping_arg,
-                         add_print_params_arg, coloring_violations, print_params,
+                         add_print_params_arg, coloring_violations, split_metrics, print_params,
                          report_results)
 
 torch.manual_seed(0)
@@ -31,6 +35,9 @@ HIDE_SEED = 0  # seed for the per-epoch random hides, separate from the model's
 parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
 add_print_params_arg(parser)
 add_early_stopping_arg(parser)
+parser.add_argument("--degree-hist", action="store_true",
+                    help="also save a histogram of test node degrees, with the "
+                         "misclassified test nodes drawn on top")
 args = parser.parse_args()
 
 data = torch.load("data/graph.pt", weights_only=False)
@@ -51,11 +58,11 @@ if int(data.train_mask.sum()) < 2:
 model = LINKX(
     num_nodes=data.num_nodes,
     in_channels=data.num_node_features + NUM_CLASSES,
-    hidden_channels=12,
-    num_layers=2,
+    hidden_channels=4,
+    num_layers=1,
     out_channels=NUM_CLASSES,
-    num_node_layers=2,
-    num_edge_layers=2,
+    num_node_layers=1,
+    num_edge_layers=1,
 )
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -91,7 +98,8 @@ def train():
     optimizer.step()
 
     train_acc = (logits[hidden_idx].argmax(dim=-1) == data.y[hidden_idx]).float().mean().item()
-    return loss.item(), train_acc
+    train_scores = split_metrics(logits[hidden_idx].argmax(dim=-1), data.y[hidden_idx], "train")
+    return loss.item(), train_acc, train_scores
 
 
 def accuracy(pred, mask):
@@ -126,27 +134,37 @@ def test():
     val_loss = masked_loss(logits, data.val_mask)
     test_loss = masked_loss(logits, data.test_mask)
 
-    return val_acc, test_acc, val_loss, test_loss
+    # Same coloring as the final report: train nodes clamped, the rest predicted.
+    counts = coloring_violations(pred, data.y, data.edge_index, data.train_mask, verbose=False)
+
+    return (val_acc, test_acc, val_loss, test_loss,
+            counts["violation_ratio"], counts["node_violation_ratio"])
 
 
 losses = []
 val_losses = []
 train_accs = []
+train_scores_per_epoch = []
 val_accs = []
 test_losses = []
 test_accs = []
+violation_ratios = []
+node_violation_ratios = []
 stopper = EarlyStopping(args.patience)
 for epoch in range(1, EPOCHS + 1):
-    loss, train_acc = train()
-    val_acc, test_acc, val_loss, test_loss = test()
+    loss, train_acc, train_scores = train()
+    val_acc, test_acc, val_loss, test_loss, violation_ratio, node_violation_ratio = test()
     losses.append(loss)
     val_losses.append(val_loss)
     train_accs.append(train_acc)
+    train_scores_per_epoch.append(train_scores)
     val_accs.append(val_acc)
     test_losses.append(test_loss)
     test_accs.append(test_acc)
+    violation_ratios.append(violation_ratio)
+    node_violation_ratios.append(node_violation_ratio)
     print(
-        f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}"
+        f"Epoch: {epoch:03d}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}, Violation Ratio: {violation_ratio:.4f}, Node Violation Ratio: {node_violation_ratio:.4f}"
     )
     if stopper.step(val_loss, model, epoch):
         break
@@ -155,7 +173,7 @@ for epoch in range(1, EPOCHS + 1):
 stopper.restore(model)
 best_epoch = stopper.best_epoch
 
-val_acc, test_acc, val_loss, test_loss = test()
+val_acc, test_acc, val_loss, test_loss, _, _ = test()
 print(f"Final: Val Loss: {val_loss:.4f}, Test Loss: {test_loss:.4f}, Val Acc: {val_acc:.4f}, Test Acc: {test_acc:.4f}")
 
 predictions = evaluate().argmax(dim=-1)
@@ -165,29 +183,66 @@ print("Predictions for unlabeled nodes:", unlabeled_predictions)
 violations = coloring_violations(predictions, data.y, data.edge_index, data.train_mask)
 report_results(
     train_acc=train_accs[best_epoch - 1] if best_epoch is not None else float("nan"),
-    val_acc=val_acc, test_acc=test_acc, best_epoch=best_epoch, **violations)
+    val_acc=val_acc, test_acc=test_acc,
+    **(train_scores_per_epoch[best_epoch - 1] if best_epoch is not None else {}),
+    **split_metrics(predictions[data.val_mask], data.y[data.val_mask], "val"),
+    **split_metrics(predictions[data.test_mask], data.y[data.test_mask], "test"),
+    best_epoch=best_epoch, **violations)
 
 if args.print_params:
     print_params(model)
 
 epochs = range(1, len(losses) + 1)
-fig, (ax_loss, ax_acc) = plt.subplots(2, 1, sharex=True, figsize=(7, 8))
+fig, (ax_loss, ax_acc, ax_viol) = plt.subplots(3, 1, sharex=True, figsize=(7, 11))
 ax_loss.plot(epochs, losses, label="Training loss (hidden train nodes)")
 ax_loss.plot(epochs, val_losses, label="Validation loss")
 ax_loss.plot(epochs, test_losses, label="Test loss")
-ax_acc.plot(epochs, train_accs, label="Training accuracy (hidden train nodes)")
-ax_acc.plot(epochs, val_accs, label="Validation accuracy")
-ax_acc.plot(epochs, test_accs, label="Test accuracy")
-for ax in (ax_loss, ax_acc):
+for accs, label in ((train_accs, "Training accuracy (hidden train nodes)"),
+                    (val_accs, "Validation accuracy"), (test_accs, "Test accuracy")):
+    if best_epoch is not None:
+        label += f": {accs[best_epoch - 1]:.3f} at best epoch"
+    (line,) = ax_acc.plot(epochs, accs, label=label)
+    if best_epoch is not None:  # mark the value the restored model reports
+        ax_acc.plot(best_epoch, accs[best_epoch - 1], "o", color=line.get_color())
+ax_viol.plot(epochs, violation_ratios, color="tab:red",
+             label="Coloring violations / total edges")
+ax_viol.plot(epochs, node_violation_ratios, color="tab:purple",
+             label="Violating nodes / total nodes")
+for ax in (ax_loss, ax_acc, ax_viol):
     if best_epoch is not None:
         ax.axvline(best_epoch, color="gray", linestyle="--", label=f"Best epoch ({best_epoch})")
     ax.legend()
     ax.grid(True, alpha=0.3)
 ax_loss.set_ylabel("Loss")
-ax_loss.set_title("LINKX (multiple hides): loss and accuracy vs epoch")
+ax_loss.set_title("LINKX (multiple hides): loss, accuracy and violation ratio vs epoch")
 ax_acc.set_ylabel("Accuracy")
 ax_acc.set_ylim(0, 1)
-ax_acc.set_xlabel("Epoch")
+ax_viol.set_ylabel("Violation ratio")
+ax_viol.set_ylim(bottom=0)
+ax_viol.set_xlabel("Epoch")
 plt.savefig("loss_LINKX_multi_hide.png", dpi=150, bbox_inches="tight")
-print("Saved loss plot to loss_LINKX_multi_hide.png")
+print("Saved loss/accuracy/violations plot to loss_LINKX_multi_hide.png")
+
+if args.degree_hist and int(data.test_mask.sum()) == 0:
+    print("Not saving the degree histogram: the graph has no test nodes.")
+elif args.degree_hist:
+    # edge_index lists each undirected edge in both directions, so this counts neighbors.
+    degree = torch.bincount(data.edge_index[0], minlength=data.num_nodes).cpu()
+    test_mask = data.test_mask.cpu()
+    misclassified = test_mask & (predictions.cpu() != data.y.cpu())
+    bins = [d - 0.5 for d in range(int(degree[test_mask].max()) + 2)]  # one bar per degree
+    fig_deg, ax_deg = plt.subplots(figsize=(7, 4.5))
+    ax_deg.hist(degree[test_mask].tolist(), bins=bins, color="tab:blue", alpha=0.45,
+                label=f"All test nodes ({int(test_mask.sum())})")
+    # Drawn second, so the misclassified nodes sit on top of all test nodes.
+    ax_deg.hist(degree[misclassified].tolist(), bins=bins, color="tab:red",
+                label=f"Misclassified test nodes ({int(misclassified.sum())})")
+    ax_deg.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax_deg.set_xlabel("Degree")
+    ax_deg.set_ylabel("Number of test nodes")
+    ax_deg.set_title("LINKX (multiple hides): degree distribution of test nodes")
+    ax_deg.legend()
+    ax_deg.grid(True, alpha=0.3)
+    fig_deg.savefig("degree_hist_LINKX_multi_hide.png", dpi=150, bbox_inches="tight")
+    print("Saved test node degree histogram to degree_hist_LINKX_multi_hide.png")
 plt.show()

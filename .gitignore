@@ -3,3 +3,5 @@ graph.json
 **/__pycache__/
 *.png
 runs/
+saved_runs/
+medium/

@@ -53,7 +53,7 @@ LAYOUT_REFINE = 3  # how many of the best candidates are refined by local search
 
 # Defaults used when the user presses Enter at a prompt.
 DEFAULT_NUM_NODES = 1000
-DEFAULT_NUM_EDGES = 2200
+DEFAULT_NUM_EDGES = 3000
 DEFAULT_NODE_WEIGHTS = "1 1 1"
 DEFAULT_EDGE_WEIGHTS = "1 1 1"
 DEFAULT_TRAIN_FRAC = 0.5
@@ -447,7 +447,7 @@ def main():
     val_default = min(DEFAULT_VAL_FRAC, 1 - train_frac)
     val_frac = prompt_float(
         f"Fraction of validation nodes [{val_default:g}]: ", val_default, 1 - train_frac)
-    num_features = prompt_int("Number of node features: ", minimum=1)
+    num_features = prompt_int("Number of node features[8]: ",default=8,  minimum=1)
     print("Feature type:\n  1) Random values\n"
           "  2) Orthogonal vector per color + noise per node")
     while (choice := input("Choose 1 or 2: ").strip()) not in ("1", "2"):
@@ -457,10 +457,10 @@ def main():
     if feature_type == "orthogonal":
         while num_features < len(COLORS):
             print(f"  Orthogonal features need at least {len(COLORS)} dimensions.")
-            num_features = prompt_int("Number of node features: ", minimum=1)
-        noise_std = prompt_float("Noise standard deviation [0.1]: ", 0.1, float("inf"))
-    seed_raw = input("Random seed (blank for random): ").strip()
-    seed = int(seed_raw) if seed_raw else random.randrange(2**32)
+            num_features = prompt_int("Number of node features[8]: ",default=8,  minimum=1)
+        noise_std = prompt_float("Noise standard deviation [0.3]: ", 0.3, float("inf"))
+    seed_raw = input("Random seed (blank for 42): ").strip()
+    seed = int(seed_raw) if seed_raw else 42
     out_path = input("Output file [data/graph.pt]: ").strip() or "data/graph.pt"
 
     try:

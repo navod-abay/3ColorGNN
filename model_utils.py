@@ -44,26 +44,70 @@ def report_results(**metrics):
     print(RESULTS_PREFIX + json.dumps(metrics))
 
 
-def coloring_violations(pred, y, edge_index, known_mask):
+def split_metrics(pred, y, split, num_classes=3):
+    """Macro F1 plus per-class F1 and accuracy of `pred` against `y`, for report_results.
+
+    Keys are prefixed with `split` (e.g. "val"): `val_f1` is the macro F1,
+    `val_f1_class<c>` the F1 of class c and `val_acc_class<c>` the share of
+    class-c nodes predicted as c. Each class's F1 is 2*TP / (2*TP + FP + FN);
+    the macro F1 is their unweighted mean, so a minority class counts as much
+    as the majority class. A class absent from both `pred` and `y` gets NaN
+    F1 and is left out of the mean; a class absent from `y` gets NaN accuracy.
+    """
+    nan = float("nan")
+    metrics = {}
+    f1s = []
+    for c in range(num_classes):
+        tp = int(((pred == c) & (y == c)).sum())
+        fp = int(((pred == c) & (y != c)).sum())
+        fn = int(((pred != c) & (y == c)).sum())
+        f1 = 2 * tp / (2 * tp + fp + fn) if tp + fp + fn else nan
+        metrics[f"{split}_f1_class{c}"] = f1
+        metrics[f"{split}_acc_class{c}"] = tp / (tp + fn) if tp + fn else nan
+        if not math.isnan(f1):
+            f1s.append(f1)
+    metrics[f"{split}_f1"] = sum(f1s) / len(f1s) if f1s else nan
+    return metrics
+
+
+def coloring_violations(pred, y, edge_index, known_mask, verbose=True):
     """Count edges whose two endpoints get the same color in the final coloring.
 
     The final coloring gives known nodes (`known_mask`, the train nodes) their
     true color `y` and every other node its predicted color `pred`. Edges
     between two known nodes can never violate, so the rate is taken over the
-    edges that touch at least one predicted node. `edge_index` may list each
-    undirected edge in both directions; each edge is counted once.
-    Prints a summary and returns the counts as a dict for report_results.
+    edges that touch at least one predicted node; the ratio is taken over all
+    edges. `edge_index` may list each undirected edge in both directions; each
+    edge is counted once. A node violates the coloring when it shares its color
+    with at least one neighbor (it is an endpoint of a violating edge); the node
+    violation ratio is taken over all nodes.
+    Prints a summary (unless `verbose` is False, e.g. when called every epoch)
+    and returns the counts as a dict for report_results.
     """
     colors = torch.where(known_mask, y, pred)
     src, dst = edge_index
     once = src < dst
     src, dst = src[once], dst[once]
-    violations = int((colors[src] == colors[dst]).sum())
+    violating = colors[src] == colors[dst]
+    violations = int(violating.sum())
     checked = int((~(known_mask[src] & known_mask[dst])).sum())
+    total = int(once.sum())
     rate = violations / checked if checked else float("nan")
-    print(f"Coloring violations: {violations} of {checked} edges touching a predicted node "
-          f"({rate:.2%}); {int(once.sum())} edges in total")
-    return {"violations": violations, "checked_edges": checked, "violation_rate": rate}
+    ratio = violations / total if total else float("nan")
+    in_conflict = torch.zeros_like(known_mask)
+    in_conflict[src[violating]] = True
+    in_conflict[dst[violating]] = True
+    violating_nodes = int(in_conflict.sum())
+    num_nodes = colors.numel()
+    node_ratio = violating_nodes / num_nodes if num_nodes else float("nan")
+    if verbose:
+        print(f"Coloring violations: {violations} of {checked} edges touching a predicted node "
+              f"({rate:.2%}); {violations} of {total} edges in total ({ratio:.2%}); "
+              f"{violating_nodes} of {num_nodes} nodes share a color with a neighbor "
+              f"({node_ratio:.2%})")
+    return {"violations": violations, "checked_edges": checked, "violation_rate": rate,
+            "total_edges": total, "violation_ratio": ratio,
+            "violating_nodes": violating_nodes, "node_violation_ratio": node_ratio}
 
 
 def add_early_stopping_arg(parser, default=DEFAULT_PATIENCE):

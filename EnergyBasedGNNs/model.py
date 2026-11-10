@@ -7,7 +7,7 @@ class EnergyBasedGNN(torch.nn.Module):
         self.conv1 = GCNConv(num_node_features, hidden_channels)
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
 
-        self.node_energy = torch.nn.Linear(hidden_channels + num_classes, 1)
+        self.node_scores = torch.nn.Linear(hidden_channels, num_classes)
 
         self.edge_energy = torch.nn.Sequential(
             torch.nn.Linear(2 *  num_classes, hidden_channels),
@@ -17,9 +17,10 @@ class EnergyBasedGNN(torch.nn.Module):
 
     def forward(self, x, edge_index, y_onehot):
         h = self.conv1(x, edge_index)
+        h = torch.relu(h)
         h = self.conv2(h, edge_index)
 
-        node_energy = self.node_energy(torch.cat([h, y_onehot], dim=-1)).sum()
+        node_energy = -(self.node_scores(h) * y_onehot).sum()
         edge_energy = self.edge_energy(torch.cat([y_onehot[edge_index[0]], y_onehot[edge_index[1]]], dim=-1)).sum()
 
         total_energy = node_energy + edge_energy
